@@ -41,6 +41,13 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Отслеживаемый игрок для каждого Telegram-чата.
+# Формат: {chat_id: {"name": "...", "last_seen": True/False/None}}
+targets = {}
+
+# Как часто проверять отслеживаемого игрока.
+TARGET_CHECK_INTERVAL = 10
+
 
 # ============================================================
 # FLASK ДЛЯ KOYEB
@@ -146,6 +153,92 @@ def make_status_text():
 
 
 # ============================================================
+# /TARGET
+# ============================================================
+
+def find_player(players, target_name):
+    """Ищет игрока без учёта регистра."""
+    target = target_name.casefold()
+
+    for player in players:
+        if player.casefold() == target:
+            return player
+
+    return None
+
+
+async def target_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/target Fanbi\n\n"
+            "После этого бот будет сообщать о входе и выходе игрока."
+        )
+        return
+
+    target_name = " ".join(context.args).strip()
+
+    data = get_server_status()
+
+    if not data["online"]:
+        last_seen = None
+        status_text = (
+            "🔴 Сервер сейчас OFFLINE.\n"
+            "Начальное состояние игрока определю при следующей проверке."
+        )
+    elif not data["players"]:
+        last_seen = None
+        status_text = (
+            "⚠️ Сервер сейчас не предоставляет список игроков.\n"
+            "Состояние игрока определю, когда список снова станет доступен."
+        )
+    else:
+        found = find_player(data["players"], target_name)
+        last_seen = found is not None
+
+        if found:
+            status_text = f"🟢 <b>{found}</b> сейчас онлайн."
+        else:
+            status_text = f"🔴 <b>{target_name}</b> сейчас не на сервере."
+
+    targets[chat_id] = {
+        "name": target_name,
+        "last_seen": last_seen,
+    }
+
+    await update.message.reply_text(
+        f"🎯 Теперь отслеживаю <b>{target_name}</b>.\n\n"
+        f"{status_text}\n\n"
+        f"🔄 Проверка каждые {TARGET_CHECK_INTERVAL} секунд.",
+        parse_mode="HTML",
+    )
+
+
+async def untarget_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+
+    if chat_id not in targets:
+        await update.message.reply_text("Сейчас никто не отслеживается.")
+        return
+
+    name = targets[chat_id]["name"]
+    del targets[chat_id]
+
+    await update.message.reply_text(
+        f"🛑 Перестал отслеживать <b>{name}</b>.",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
 # /START
 # ============================================================
 
@@ -158,7 +251,9 @@ async def start_command(
         "Команды:\n"
         "/status — состояние сервера\n"
         "/online — количество игроков\n"
-        "/players — список игроков",
+        "/players — список игроков\n"
+        "/target Fanbi — отслеживать игрока\n"
+        "/untarget — перестать отслеживать",
         parse_mode="HTML",
     )
 
@@ -256,9 +351,54 @@ async def automatic_check(
             data["players_max"],
         )
     else:
-        logger.info(
-            "Minecraft OFFLINE"
-        )
+        logger.info("Minecraft OFFLINE")
+
+    if not targets:
+        return
+
+    # Если сервер OFFLINE, не считаем это выходом игрока.
+    if not data["online"]:
+        return
+
+    # Если сервер не дал список игроков, ждём следующую проверку.
+    if not data["players"]:
+        return
+
+    for chat_id, target in list(targets.items()):
+        target_name = target["name"]
+        previous = target["last_seen"]
+
+        current = find_player(data["players"], target_name) is not None
+
+        # Первое достоверное состояние только запоминаем.
+        if previous is None:
+            target["last_seen"] = current
+            continue
+
+        if current == previous:
+            continue
+
+        target["last_seen"] = current
+
+        try:
+            if current:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🟢 <b>{target_name}</b> зашёл на сервер!",
+                    parse_mode="HTML",
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔴 <b>{target_name}</b> вышел с сервера!",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning(
+                "Не удалось отправить уведомление в чат %s: %s",
+                chat_id,
+                e,
+            )
 
 
 # ============================================================
@@ -302,10 +442,18 @@ def main():
         CommandHandler("players", players_command)
     )
 
-    # Проверка Minecraft каждые 60 секунд
+    application.add_handler(
+        CommandHandler("target", target_command)
+    )
+
+    application.add_handler(
+        CommandHandler("untarget", untarget_command)
+    )
+
+    # Проверка Minecraft каждые 10 секунд
     application.job_queue.run_repeating(
         automatic_check,
-        interval=60,
+        interval=TARGET_CHECK_INTERVAL,
         first=10,
     )
 
