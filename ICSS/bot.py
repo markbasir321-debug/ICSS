@@ -176,7 +176,7 @@ async def target_command(
     if not context.args:
         await update.message.reply_text(
             "Использование:\n"
-            "/target Fanbi\n\n"
+            "/target Nick\n\n"
             "После этого бот будет сообщать о входе и выходе игрока."
         )
         return
@@ -252,7 +252,7 @@ async def start_command(
         "/status — состояние сервера\n"
         "/online — количество игроков\n"
         "/players — список игроков\n"
-        "/target Fanbi — отслеживать игрока\n"
+        "/target — отслеживать игрока\n"
         "/untarget — перестать отслеживать",
         parse_mode="HTML",
     )
