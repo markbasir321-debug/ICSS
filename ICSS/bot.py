@@ -1,7 +1,6 @@
 import os
 import io
 import json
-import html
 import threading
 import logging
 from datetime import datetime, timezone
@@ -19,7 +18,10 @@ from mcstatus import JavaServer
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from googleapiclient.http import (
+    MediaIoBaseUpload,
+    MediaIoBaseDownload,
+)
 
 
 # ============================================================
@@ -30,16 +32,6 @@ MINECRAFT_IP = "194.93.2.184"
 MINECRAFT_PORT = 25554
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "Не задана переменная окружения TELEGRAM_BOT_TOKEN"
-    )
-
-
-# ============================================================
-# GOOGLE DRIVE
-# ============================================================
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get(
     "GOOGLE_SERVICE_ACCOUNT_JSON"
@@ -60,14 +52,19 @@ DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-
-# ============================================================
-# ОБЩИЕ НАСТРОЙКИ
-# ============================================================
-
 CHECK_INTERVAL = 10
 
 MAX_PLAYER_LOGS = 5000
+
+
+# ============================================================
+# ПРОВЕРКА НАСТРОЕК
+# ============================================================
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError(
+        "Не задан TELEGRAM_BOT_TOKEN"
+    )
 
 
 # ============================================================
@@ -75,8 +72,13 @@ MAX_PLAYER_LOGS = 5000
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format=(
+        "%(asctime)s - "
+        "%(name)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
 )
 
 logger = logging.getLogger(__name__)
@@ -86,39 +88,60 @@ logger = logging.getLogger(__name__)
 # ДАННЫЕ
 # ============================================================
 
-# Все игроки, которых бот когда-либо обнаружил.
-known_players = {}
-
 # История входов/выходов.
 player_logs = []
 
-# Последний известный список игроков.
+# Все игроки, которых бот когда-либо видел.
+known_players = {}
+
+# Последний полный список игроков.
 previous_players = None
+
+# Подписчики на автоматические уведомления.
+log_subscribers = set()
 
 # Игроки, отслеживаемые через /target.
 targets = {}
 
-# Чаты, куда отправляется общий лог.
-log_subscribers = set()
-
 # ID файла на Google Drive.
 drive_file_id = None
 
+# Блокировка Google Drive.
+drive_lock = threading.Lock()
+
 
 # ============================================================
-# GOOGLE DRIVE SERVICE
+# IGNORE
+# ============================================================
+
+def is_ignored_player(name):
+    if not name:
+        return True
+
+    name = str(name).strip()
+
+    ignored = {
+        "anonymous player",
+        "anonymous_player",
+    }
+
+    return name.casefold() in ignored
+
+
+# ============================================================
+# GOOGLE DRIVE
 # ============================================================
 
 def get_drive_service():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         logger.warning(
-            "GOOGLE_SERVICE_ACCOUNT_JSON не задан."
+            "GOOGLE_SERVICE_ACCOUNT_JSON не задан"
         )
         return None
 
     if not GOOGLE_DRIVE_FOLDER_ID:
         logger.warning(
-            "GOOGLE_DRIVE_FOLDER_ID не задан."
+            "GOOGLE_DRIVE_FOLDER_ID не задан"
         )
         return None
 
@@ -145,64 +168,21 @@ def get_drive_service():
 
         return service
 
-    except Exception as e:
+    except Exception:
         logger.exception(
-            "Ошибка подключения к Google Drive: %s",
-            e,
+            "Ошибка подключения к Google Drive"
         )
-
         return None
 
-
-# ============================================================
-# СОХРАНЕНИЕ ЛОКАЛЬНО
-# ============================================================
-
-def save_logs_local():
-    try:
-        data = {
-            "known_players": sorted(
-                known_players.values(),
-                key=str.casefold,
-            ),
-            "events": player_logs,
-        }
-
-        with open(
-            LOCAL_LOG_FILE,
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(
-                data,
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-        logger.info(
-            "Логи сохранены локально: %s",
-            LOCAL_LOG_FILE,
-        )
-
-    except Exception as e:
-        logger.exception(
-            "Ошибка локального сохранения: %s",
-            e,
-        )
-
-
-# ============================================================
-# GOOGLE DRIVE - ПОИСК ФАЙЛА
-# ============================================================
 
 def find_drive_file(service):
     global drive_file_id
 
     query = (
-        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
+        f"'{GOOGLE_DRIVE_FOLDER_ID}' "
+        "in parents "
         f"and name = '{GOOGLE_DRIVE_FILENAME}' "
-        f"and trashed = false"
+        "and trashed = false"
     )
 
     result = (
@@ -216,21 +196,144 @@ def find_drive_file(service):
         .execute()
     )
 
-    files = result.get(
-        "files",
-        [],
-    )
+    files = result.get("files", [])
 
-    if files:
-        drive_file_id = files[0]["id"]
-        return drive_file_id
+    if not files:
+        return None
 
-    return None
+    drive_file_id = files[0]["id"]
+
+    return drive_file_id
 
 
-# ============================================================
-# ЗАГРУЗКА С GOOGLE DRIVE
-# ============================================================
+def save_logs_to_drive():
+    global drive_file_id
+
+    service = get_drive_service()
+
+    if service is None:
+        return False
+
+    try:
+        with drive_lock:
+
+            data = {
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
+                "players": list(
+                    known_players.values()
+                ),
+
+                "events": player_logs,
+            }
+
+            raw = json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+
+            media = MediaIoBaseUpload(
+                io.BytesIO(raw),
+                mimetype="application/json",
+                resumable=False,
+            )
+
+            if drive_file_id is None:
+                drive_file_id = find_drive_file(
+                    service
+                )
+
+            if drive_file_id:
+
+                (
+                    service.files()
+                    .update(
+                        fileId=drive_file_id,
+                        media_body=media,
+                        fields="id",
+                    )
+                    .execute()
+                )
+
+                logger.info(
+                    "Логи обновлены на Google Drive"
+                )
+
+            else:
+
+                metadata = {
+                    "name": GOOGLE_DRIVE_FILENAME,
+                    "parents": [
+                        GOOGLE_DRIVE_FOLDER_ID
+                    ],
+                }
+
+                created = (
+                    service.files()
+                    .create(
+                        body=metadata,
+                        media_body=media,
+                        fields="id",
+                    )
+                    .execute()
+                )
+
+                drive_file_id = created["id"]
+
+                logger.info(
+                    "Создан player_logs.json "
+                    "на Google Drive"
+                )
+
+        return True
+
+    except Exception:
+        logger.exception(
+            "Ошибка сохранения на Google Drive"
+        )
+        return False
+
+
+def save_local_backup():
+    try:
+        data = {
+            "updated_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+            "players": list(
+                known_players.values()
+            ),
+
+            "events": player_logs,
+        }
+
+        with open(
+            LOCAL_LOG_FILE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        logger.info(
+            "Локальная резервная копия сохранена: %s",
+            LOCAL_LOG_FILE,
+        )
+
+    except Exception:
+        logger.exception(
+            "Ошибка локального сохранения"
+        )
+
 
 def load_logs_from_drive():
     global drive_file_id
@@ -241,29 +344,32 @@ def load_logs_from_drive():
 
     if service is None:
         logger.warning(
-            "Google Drive недоступен. Используется локальный файл."
+            "Google Drive недоступен. "
+            "Пробуем локальный JSON."
         )
-
-        load_logs_local()
-
+        load_local_backup()
         return
 
     try:
-        file_id = find_drive_file(service)
+        drive_file_id = find_drive_file(
+            service
+        )
 
-        if not file_id:
+        if not drive_file_id:
+
             logger.info(
-                "player_logs.json на Google Drive ещё нет."
+                "player_logs.json на Google Drive "
+                "ещё не существует."
             )
 
-            load_logs_local()
+            load_local_backup()
 
             return
 
         request = (
             service.files()
             .get_media(
-                fileId=file_id
+                fileId=drive_file_id
             )
         )
 
@@ -277,128 +383,104 @@ def load_logs_from_drive():
         done = False
 
         while not done:
-            _, done = downloader.next_chunk()
-
-        raw = buffer.getvalue()
-
-        if not raw:
-            logger.warning(
-                "Google Drive вернул пустой файл."
+            _, done = (
+                downloader.next_chunk()
             )
 
-            return
-
-        data = json.loads(
-            raw.decode("utf-8")
+        raw = (
+            buffer
+            .getvalue()
+            .decode("utf-8")
         )
 
-        # Новый формат
+        data = json.loads(raw)
+
+        # Новый формат.
         if isinstance(data, dict):
 
-            loaded_players = data.get(
-                "known_players",
-                [],
-            )
-
-            loaded_events = data.get(
+            events = data.get(
                 "events",
-                [],
+                []
             )
 
-            if isinstance(
-                loaded_players,
-                list,
-            ):
-                known_players = {}
+            players = data.get(
+                "players",
+                []
+            )
 
-                for player in loaded_players:
-                    if isinstance(
-                        player,
-                        str,
-                    ):
-                        known_players[
-                            player.casefold()
-                        ] = player
-
-            if isinstance(
-                loaded_events,
-                list,
-            ):
-                player_logs = (
-                    loaded_events[
-                        -MAX_PLAYER_LOGS:
-                    ]
-                )
-
-        # Старый формат — просто список событий
-        elif isinstance(data, list):
-
-            player_logs = (
-                data[
+            if isinstance(events, list):
+                player_logs = events[
                     -MAX_PLAYER_LOGS:
                 ]
-            )
 
-            known_players = {}
+            if isinstance(players, list):
+
+                for player in players:
+
+                    if not is_ignored_player(
+                        player
+                    ):
+
+                        key = (
+                            player
+                            .casefold()
+                        )
+
+                        known_players[key] = (
+                            player
+                        )
+
+        # Старый формат — просто список событий.
+        elif isinstance(data, list):
+
+            player_logs = data[
+                -MAX_PLAYER_LOGS:
+            ]
 
             for event in player_logs:
-
-                if not isinstance(
-                    event,
-                    dict,
-                ):
-                    continue
 
                 player = event.get(
                     "player"
                 )
 
-                if isinstance(
-                    player,
-                    str,
+                if (
+                    player
+                    and not is_ignored_player(
+                        player
+                    )
                 ):
+
                     known_players[
                         player.casefold()
                     ] = player
 
-        save_logs_local()
+        save_local_backup()
 
         logger.info(
-            "Google Drive: загружено игроков: %s, событий: %s",
-            len(known_players),
+            "Загружено с Google Drive: "
+            "%s событий, %s игроков",
             len(player_logs),
+            len(known_players),
         )
 
-    except Exception as e:
+    except Exception:
         logger.exception(
-            "Ошибка загрузки Google Drive: %s",
-            e,
+            "Ошибка загрузки Google Drive"
         )
 
-        load_logs_local()
+        load_local_backup()
 
 
-# ============================================================
-# ЗАГРУЗКА ЛОКАЛЬНОГО ФАЙЛА
-# ============================================================
-
-def load_logs_local():
-
+def load_local_backup():
     global player_logs
     global known_players
 
-    if not os.path.exists(
-        LOCAL_LOG_FILE
-    ):
-        logger.info(
-            "Локального player_logs.json нет."
-        )
-
-        save_logs_local()
-
-        return
-
     try:
+
+        if not os.path.exists(
+            LOCAL_LOG_FILE
+        ):
+            return
 
         with open(
             LOCAL_LOG_FILE,
@@ -408,193 +490,96 @@ def load_logs_local():
 
             data = json.load(f)
 
-        if isinstance(
-            data,
-            dict,
-        ):
-
-            players = data.get(
-                "known_players",
-                [],
-            )
+        if isinstance(data, dict):
 
             events = data.get(
                 "events",
-                [],
+                []
             )
 
-            known_players = {}
+            players = data.get(
+                "players",
+                []
+            )
 
-            for player in players:
-
-                if isinstance(
-                    player,
-                    str,
-                ):
-                    known_players[
-                        player.casefold()
-                    ] = player
-
-            if isinstance(
-                events,
-                list,
-            ):
-                player_logs = (
-                    events[
-                        -MAX_PLAYER_LOGS:
-                    ]
-                )
-
-        elif isinstance(
-            data,
-            list,
-        ):
-
-            player_logs = (
-                data[
+            if isinstance(events, list):
+                player_logs = events[
                     -MAX_PLAYER_LOGS:
                 ]
-            )
 
-            known_players = {}
+            if isinstance(players, list):
+
+                for player in players:
+
+                    if not is_ignored_player(
+                        player
+                    ):
+
+                        known_players[
+                            player.casefold()
+                        ] = player
+
+        elif isinstance(data, list):
+
+            player_logs = data[
+                -MAX_PLAYER_LOGS:
+            ]
 
             for event in player_logs:
-
-                if not isinstance(
-                    event,
-                    dict,
-                ):
-                    continue
 
                 player = event.get(
                     "player"
                 )
 
-                if isinstance(
-                    player,
-                    str,
+                if (
+                    player
+                    and not is_ignored_player(
+                        player
+                    )
                 ):
+
                     known_players[
                         player.casefold()
                     ] = player
 
         logger.info(
-            "Локально загружено игроков: %s, событий: %s",
-            len(known_players),
-            len(player_logs),
+            "Загружена локальная резервная копия"
         )
 
-    except Exception as e:
+    except Exception:
         logger.exception(
-            "Ошибка чтения player_logs.json: %s",
-            e,
+            "Ошибка загрузки локального JSON"
         )
 
 
-# ============================================================
-# СОХРАНЕНИЕ НА GOOGLE DRIVE
-# ============================================================
-
-def sync_logs_to_drive():
-
-    global drive_file_id
-
-    service = get_drive_service()
-
-    if service is None:
-        return
-
-    try:
-
-        data = {
-            "known_players": sorted(
-                known_players.values(),
-                key=str.casefold,
-            ),
-            "events": player_logs,
-        }
-
-        raw = json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        ).encode("utf-8")
-
-        media = MediaIoBaseUpload(
-            io.BytesIO(raw),
-            mimetype="application/json",
-            resumable=False,
-        )
-
-        if drive_file_id is None:
-
-            drive_file_id = find_drive_file(
-                service
-            )
-
-        if drive_file_id:
-
-            service.files().update(
-                fileId=drive_file_id,
-                media_body=media,
-                fields="id",
-            ).execute()
-
-        else:
-
-            metadata = {
-                "name": GOOGLE_DRIVE_FILENAME,
-                "parents": [
-                    GOOGLE_DRIVE_FOLDER_ID
-                ],
-            }
-
-            created = (
-                service.files()
-                .create(
-                    body=metadata,
-                    media_body=media,
-                    fields="id",
-                )
-                .execute()
-            )
-
-            drive_file_id = created["id"]
-
-        logger.info(
-            "player_logs.json синхронизирован с Google Drive."
-        )
-
-    except Exception as e:
-        logger.exception(
-            "Ошибка синхронизации Google Drive: %s",
-            e,
-        )
+def save_everything():
+    save_local_backup()
+    save_logs_to_drive()
 
 
 # ============================================================
-# ДОБАВЛЕНИЕ ИГРОКА В СПИСОК
+# ДОБАВЛЕНИЕ ИГРОКА
 # ============================================================
 
-def add_known_player(player):
-
-    if not player:
+def register_player(name):
+    if is_ignored_player(name):
         return False
 
-    key = player.casefold()
+    name = str(name).strip()
+
+    key = name.casefold()
 
     if key in known_players:
         return False
 
-    known_players[key] = player
+    known_players[key] = name
 
     logger.info(
-        "Новый игрок добавлен в known_players: %s",
-        player,
+        "Новый игрок добавлен в список: %s",
+        name,
     )
 
-    save_logs_local()
-    sync_logs_to_drive()
+    save_everything()
 
     return True
 
@@ -603,34 +588,26 @@ def add_known_player(player):
 # ДОБАВЛЕНИЕ СОБЫТИЯ
 # ============================================================
 
-def add_player_log(
-    event,
-    player,
-):
+def add_player_log(event, player):
 
-    if not player:
+    if is_ignored_player(player):
         return
 
-    add_known_player(
-        player
-    )
+    register_player(player)
 
     entry = {
-        "time": (
-            datetime
-            .now(timezone.utc)
-            .astimezone()
-            .strftime(
-                "%d.%m.%Y %H:%M:%S"
-            )
+        "time": datetime.now(
+            timezone.utc
+        ).astimezone().strftime(
+            "%d.%m.%Y %H:%M:%S"
         ),
+
         "event": event,
+
         "player": player,
     }
 
-    player_logs.append(
-        entry
-    )
+    player_logs.append(entry)
 
     if len(player_logs) > MAX_PLAYER_LOGS:
 
@@ -638,14 +615,13 @@ def add_player_log(
             :-MAX_PLAYER_LOGS
         ]
 
-    save_logs_local()
-    sync_logs_to_drive()
-
     logger.info(
         "PLAYER %s: %s",
         event.upper(),
         player,
     )
+
+    save_everything()
 
 
 # ============================================================
@@ -657,7 +633,6 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-
     return (
         "Minecraft Telegram Bot is running",
         200,
@@ -666,11 +641,7 @@ def home():
 
 @web_app.route("/health")
 def health():
-
-    return (
-        "OK",
-        200,
-    )
+    return "OK", 200
 
 
 def run_web():
@@ -678,7 +649,7 @@ def run_web():
     port = int(
         os.environ.get(
             "PORT",
-            "8000",
+            "10000"
         )
     )
 
@@ -689,7 +660,7 @@ def run_web():
 
 
 # ============================================================
-# MINECRAFT STATUS
+# MINECRAFT
 # ============================================================
 
 def get_server_status():
@@ -723,23 +694,37 @@ def get_server_status():
                 status.players.sample
             ):
 
-                if player.name:
+                if not player:
+                    continue
 
-                    players.append(
-                        player.name
-                    )
+                name = getattr(
+                    player,
+                    "name",
+                    None,
+                )
+
+                if not name:
+                    continue
+
+                if is_ignored_player(
+                    name
+                ):
+                    continue
+
+                players.append(
+                    name
+                )
 
         # Убираем дубли.
-        unique_players = {}
+        unique = {}
 
         for player in players:
-
-            unique_players[
+            unique[
                 player.casefold()
             ] = player
 
         players = list(
-            unique_players.values()
+            unique.values()
         )
 
         return {
@@ -781,21 +766,13 @@ def find_player(
 
     for player in players:
 
-        if player.casefold() == target:
+        if (
+            player.casefold()
+            == target
+        ):
             return player
 
     return None
-
-
-# ============================================================
-# HTML SAFE
-# ============================================================
-
-def safe(text):
-
-    return html.escape(
-        str(text)
-    )
 
 
 # ============================================================
@@ -807,18 +784,34 @@ async def start_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    await update.message.reply_text(
+    text = (
         "🤖 <b>Minecraft Server Bot</b>\n\n"
+
+        "Команды:\n"
+
         "/status — состояние сервера\n"
+
         "/online — количество игроков\n"
-        "/players — текущий список игроков\n"
-        "/target &lt;ник&gt; — отслеживать игрока\n"
-        "/untarget — прекратить отслеживание\n"
-        "/log — включить/выключить общий лог\n"
+
+        "/players — все игроки онлайн\n"
+
+        "/ap — все игроки из истории\n"
+
+        "/target ник — отслеживать игрока\n"
+
+        "/untarget — убрать отслеживание\n"
+
+        "/log — включить/выключить уведомления\n"
+
         "/logs — последние события\n"
-        "/logger — история игроков\n"
-        "/logger &lt;ник&gt; — история конкретного игрока\n"
-        "/ap — все обнаруженные игроки",
+
+        "/logger — общий лог\n"
+
+        "/logger ник — история игрока"
+    )
+
+    await update.message.reply_text(
+        text,
         parse_mode="HTML",
     )
 
@@ -845,37 +838,19 @@ async def status_command(
 
     text = (
         "🟢 <b>Сервер ONLINE</b>\n\n"
-        f"🌐 <code>{safe(MINECRAFT_IP)}:"
-        f"{MINECRAFT_PORT}</code>\n"
+
+        f"🌐 <code>"
+        f"{MINECRAFT_IP}:"
+        f"{MINECRAFT_PORT}"
+        f"</code>\n"
+
         f"👥 Игроков: "
         f"<b>{data['players_online']}/"
         f"{data['players_max']}</b>\n"
+
         f"📡 Ping: "
         f"<b>{data['latency']} ms</b>"
     )
-
-    if data["players"]:
-
-        text += (
-            "\n\n👤 <b>Полученный список:</b>\n"
-        )
-
-        for player in data["players"]:
-
-            text += (
-                f"• {safe(player)}\n"
-            )
-
-    if (
-        data["players_online"]
-        > len(data["players"])
-    ):
-
-        text += (
-            "\n⚠️ Minecraft Status "
-            "предоставил не полный sample "
-            "игроков."
-        )
 
     await update.message.reply_text(
         text,
@@ -903,8 +878,7 @@ async def online_command(
         return
 
     await update.message.reply_text(
-        f"🟢 Сервер ONLINE\n\n"
-        f"👥 Игроков: "
+        f"🟢 Игроков онлайн: "
         f"{data['players_online']}/"
         f"{data['players_max']}"
     )
@@ -929,47 +903,113 @@ async def players_command(
 
         return
 
-    if not data["players"]:
-
-        await update.message.reply_text(
-            f"🟢 Сервер ONLINE\n"
-            f"👥 Игроков: "
-            f"{data['players_online']}/"
-            f"{data['players_max']}\n\n"
-            "Список игроков сервер не предоставил."
-        )
-
-        return
+    players = data["players"]
 
     text = (
-        f"🟢 Игроков онлайн: "
+        f"🟢 <b>Игроков онлайн: "
         f"{data['players_online']}/"
-        f"{data['players_max']}\n\n"
-        "👤 <b>Полученный список:</b>\n"
+        f"{data['players_max']}</b>\n\n"
     )
 
-    for player in data["players"]:
+    if not players:
 
         text += (
-            f"• {safe(player)}\n"
+            "⚠️ Сервер не передал список "
+            "игроков через status query."
         )
 
-    if (
-        data["players_online"]
-        > len(data["players"])
-    ):
+    else:
 
         text += (
-            "\n⚠️ Важно: сервер сообщил "
-            f"{data['players_online']} игроков, "
-            f"но через Status API получено "
-            f"только {len(data['players'])} ников."
+            "👤 <b>Игроки:</b>\n"
         )
+
+        for i, player in enumerate(
+            players,
+            1,
+        ):
+
+            text += (
+                f"{i}. "
+                f"<code>{player}</code>\n"
+            )
 
     await update.message.reply_text(
         text,
         parse_mode="HTML",
     )
+
+
+# ============================================================
+# /AP
+# ============================================================
+
+async def ap_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not known_players:
+
+        await update.message.reply_text(
+            "📋 Список игроков пока пуст."
+        )
+
+        return
+
+    players = sorted(
+        known_players.values(),
+        key=str.casefold,
+    )
+
+    lines = [
+        "👤 <b>Все игроки, "
+        "которых видел бот:</b>\n"
+    ]
+
+    for i, player in enumerate(
+        players,
+        1,
+    ):
+
+        lines.append(
+            f"{i}. <code>{player}</code>"
+        )
+
+    # Telegram имеет ограничение размера сообщения.
+    text = "\n".join(lines)
+
+    if len(text) <= 4000:
+
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+        )
+
+        return
+
+    # Если игроков очень много — разбиваем.
+    chunk = ""
+
+    for line in lines:
+
+        if len(chunk) + len(line) > 3800:
+
+            await update.message.reply_text(
+                chunk,
+                parse_mode="HTML",
+            )
+
+            chunk = ""
+
+        chunk += line + "\n"
+
+    if chunk:
+
+        await update.message.reply_text(
+            chunk,
+            parse_mode="HTML",
+        )
 
 
 # ============================================================
@@ -981,15 +1021,13 @@ async def target_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    chat_id = (
-        update.effective_chat.id
-    )
+    chat_id = update.effective_chat.id
 
     if not context.args:
 
         await update.message.reply_text(
             "Использование:\n"
-            "/target <ник>"
+            "/target ник"
         )
 
         return
@@ -997,52 +1035,24 @@ async def target_command(
     target_name = (
         " ".join(
             context.args
-        )
-        .strip()
+        ).strip()
     )
 
     data = get_server_status()
 
-    if not data["online"]:
+    last_seen = None
 
-        last_seen = None
+    if data["online"]:
 
-        status_text = (
-            "🔴 Сервер сейчас OFFLINE."
-        )
+        if data["players"]:
 
-    elif not data["players"]:
-
-        last_seen = None
-
-        status_text = (
-            "⚠️ Список игроков сейчас "
-            "не предоставлен."
-        )
-
-    else:
-
-        found = find_player(
-            data["players"],
-            target_name,
-        )
-
-        last_seen = (
-            found is not None
-        )
-
-        if found:
-
-            status_text = (
-                f"🟢 <b>{safe(found)}</b> "
-                "сейчас онлайн."
+            found = find_player(
+                data["players"],
+                target_name,
             )
 
-        else:
-
-            status_text = (
-                f"🔴 <b>{safe(target_name)}</b> "
-                "сейчас не на сервере."
+            last_seen = (
+                found is not None
             )
 
     targets[chat_id] = {
@@ -1050,10 +1060,31 @@ async def target_command(
         "last_seen": last_seen,
     }
 
+    if last_seen is True:
+
+        status = (
+            f"🟢 <b>{target_name}</b> "
+            "сейчас онлайн."
+        )
+
+    elif last_seen is False:
+
+        status = (
+            f"🔴 <b>{target_name}</b> "
+            "сейчас офлайн."
+        )
+
+    else:
+
+        status = (
+            "⚠️ Состояние пока "
+            "неизвестно."
+        )
+
     await update.message.reply_text(
-        f"🎯 Теперь отслеживаю "
-        f"<b>{safe(target_name)}</b>.\n\n"
-        f"{status_text}\n\n"
+        f"🎯 Отслеживание: "
+        f"<b>{target_name}</b>\n\n"
+        f"{status}\n\n"
         f"🔄 Проверка каждые "
         f"{CHECK_INTERVAL} секунд.",
         parse_mode="HTML",
@@ -1069,11 +1100,14 @@ async def untarget_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    chat_id = (
-        update.effective_chat.id
+    chat_id = update.effective_chat.id
+
+    target = targets.pop(
+        chat_id,
+        None,
     )
 
-    if chat_id not in targets:
+    if not target:
 
         await update.message.reply_text(
             "Сейчас никто не отслеживается."
@@ -1081,17 +1115,9 @@ async def untarget_command(
 
         return
 
-    name = targets[
-        chat_id
-    ]["name"]
-
-    del targets[
-        chat_id
-    ]
-
     await update.message.reply_text(
         f"🛑 Перестал отслеживать "
-        f"<b>{safe(name)}</b>.",
+        f"<b>{target['name']}</b>.",
         parse_mode="HTML",
     )
 
@@ -1105,9 +1131,7 @@ async def log_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    chat_id = (
-        update.effective_chat.id
-    )
+    chat_id = update.effective_chat.id
 
     if chat_id in log_subscribers:
 
@@ -1116,20 +1140,18 @@ async def log_command(
         )
 
         await update.message.reply_text(
-            "🛑 Общий лог выключен."
+            "🛑 Уведомления о входах/выходах выключены."
         )
 
-        return
+    else:
 
-    log_subscribers.add(
-        chat_id
-    )
+        log_subscribers.add(
+            chat_id
+        )
 
-    await update.message.reply_text(
-        "📋 Общий лог включён.\n\n"
-        "Бот будет отправлять сообщения "
-        "о новых входах и выходах."
-    )
+        await update.message.reply_text(
+            "🟢 Уведомления о входах/выходах включены."
+        )
 
 
 # ============================================================
@@ -1144,9 +1166,7 @@ async def logs_command(
     if not player_logs:
 
         await update.message.reply_text(
-            "📋 История пока пустая.\n\n"
-            f"Известных игроков: "
-            f"{len(known_players)}"
+            "📋 Лог пока пуст."
         )
 
         return
@@ -1170,11 +1190,9 @@ async def logs_command(
         except ValueError:
             pass
 
-    entries = (
-        player_logs[
-            -limit:
-        ]
-    )
+    entries = player_logs[
+        -limit:
+    ]
 
     lines = [
         "📋 <b>Последние события</b>\n"
@@ -1182,24 +1200,45 @@ async def logs_command(
 
     for entry in entries:
 
-        if entry.get(
+        player = entry.get(
+            "player",
+            "",
+        )
+
+        if is_ignored_player(
+            player
+        ):
+            continue
+
+        event = entry.get(
             "event"
-        ) == "join":
+        )
 
-            icon = "🟢"
-            action = "зашёл"
+        icon = (
+            "🟢"
+            if event == "join"
+            else "🔴"
+        )
 
-        else:
-
-            icon = "🔴"
-            action = "вышел"
+        action = (
+            "зашёл"
+            if event == "join"
+            else "вышел"
+        )
 
         lines.append(
             f"{icon} "
-            f"<code>{safe(entry.get('time', ''))}</code> — "
-            f"<b>{safe(entry.get('player', ''))}</b> "
-            f"{action}"
+            f"<code>{entry.get('time','')}</code> "
+            f"— <b>{player}</b> {action}"
         )
+
+    if len(lines) == 1:
+
+        await update.message.reply_text(
+            "📋 Подходящих записей нет."
+        )
+
+        return
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -1216,133 +1255,88 @@ async def logger_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if context.args:
+    if not context.args:
 
-        target = (
-            " ".join(
-                context.args
-            )
-            .casefold()
+        await logs_command(
+            update,
+            context,
         )
 
-        matches = [
-            event
-            for event in player_logs
-            if str(
-                event.get(
-                    "player",
-                    ""
-                )
-            ).casefold()
-            == target
-        ]
+        return
 
-        if not matches:
+    target = (
+        " ".join(
+            context.args
+        ).casefold()
+    )
 
-            await update.message.reply_text(
-                "📋 Для этого игрока "
-                "записей пока нет."
-            )
+    matches = []
 
-            return
+    for entry in player_logs:
 
-        player_name = matches[
-            -1
-        ].get(
+        player = entry.get(
             "player",
-            target,
+            "",
         )
 
-        lines = [
-            f"📋 <b>История "
-            f"{safe(player_name)}</b>\n"
-        ]
+        if is_ignored_player(
+            player
+        ):
+            continue
 
-        for event in matches[
-            -50:
-        ]:
+        if (
+            player.casefold()
+            == target
+        ):
 
-            if event.get(
-                "event"
-            ) == "join":
-
-                icon = "🟢"
-                action = "зашёл"
-
-            else:
-
-                icon = "🔴"
-                action = "вышел"
-
-            lines.append(
-                f"{icon} "
-                f"<code>{safe(event.get('time', ''))}</code> — "
-                f"{action}"
+            matches.append(
+                entry
             )
 
+    if not matches:
+
         await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="HTML",
+            "📋 Для этого игрока "
+            "записей пока нет."
         )
 
         return
 
-    await logs_command(
-        update,
-        context,
-    )
-
-
-# ============================================================
-# /AP
-# ============================================================
-
-async def ap_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not known_players:
-
-        await update.message.reply_text(
-            "📋 Список игроков пока пуст.\n"
-            "Бот добавит игрока автоматически, "
-            "как только получит его от сервера."
-        )
-
-        return
-
-    players = sorted(
-        known_players.values(),
-        key=str.casefold,
-    )
+    real_name = matches[
+        -1
+    ]["player"]
 
     lines = [
-        "👤 <b>Все обнаруженные игроки:</b>\n"
+        f"📋 <b>История "
+        f"{real_name}</b>\n"
     ]
 
-    for player in players:
+    for entry in matches[-50:]:
 
-        lines.append(
-            f"• {safe(player)}"
+        event = entry.get(
+            "event"
         )
 
-    text = "\n".join(
-        lines
-    )
+        icon = (
+            "🟢"
+            if event == "join"
+            else "🔴"
+        )
 
-    # Telegram имеет ограничение на размер сообщения.
-    if len(text) > 4000:
+        action = (
+            "зашёл"
+            if event == "join"
+            else "вышел"
+        )
 
-        text = (
-            "\n".join(
-                lines[:300]
-            )
-            + "\n\n⚠️ Список слишком большой."
+        lines.append(
+            f"{icon} "
+            f"<code>{entry.get('time','')}</code> "
+            f"— {action}"
         )
 
     await update.message.reply_text(
-        text,
+        "\n".join(lines),
         parse_mode="HTML",
     )
 
@@ -1368,47 +1362,40 @@ async def automatic_check(
         return
 
     logger.info(
-        "Minecraft ONLINE — %s/%s игроков; "
-        "получено ников: %s",
+        "Minecraft ONLINE — "
+        "%s/%s игроков",
         data["players_online"],
         data["players_max"],
-        len(data["players"]),
     )
 
-    # --------------------------------------------------------
-    # Каждый опрос обрабатываем заново.
-    # --------------------------------------------------------
+    players = data["players"]
 
-    current_players = {}
+    # ========================================================
+    # КАЖДУЮ ПРОВЕРКУ РЕГИСТРИРУЕМ ВЕСЬ СПИСОК
+    # ========================================================
 
-    for player in data["players"]:
+    for player in players:
 
-        current_players[
-            player.casefold()
-        ] = player
+        if is_ignored_player(
+            player
+        ):
+            continue
 
-        # Автоматически добавляем
-        # каждого нового обнаруженного игрока.
-        add_known_player(
+        register_player(
             player
         )
 
-    # --------------------------------------------------------
-    # Если список вообще отсутствует,
-    # нельзя определять leave.
-    # --------------------------------------------------------
-
-    if not current_players:
-
-        logger.warning(
-            "Minecraft не предоставил список игроков."
+    current_players = {
+        player.casefold(): player
+        for player in players
+        if not is_ignored_player(
+            player
         )
+    }
 
-        return
-
-    # --------------------------------------------------------
-    # Первый нормальный опрос.
-    # --------------------------------------------------------
+    # ========================================================
+    # ПЕРВЫЙ ОПРОС
+    # ========================================================
 
     if previous_players is None:
 
@@ -1417,114 +1404,112 @@ async def automatic_check(
         )
 
         logger.info(
-            "Начальный список игроков сохранён."
+            "Первичный список игроков "
+            "сохранён: %s",
+            len(current_players),
         )
 
-        return
+    else:
 
-    # --------------------------------------------------------
-    # JOIN
-    # --------------------------------------------------------
+        # ====================================================
+        # НОВЫЕ ИГРОКИ
+        # ====================================================
 
-    joined = (
-        set(current_players)
-        - set(previous_players)
-    )
-
-    # --------------------------------------------------------
-    # LEAVE
-    # --------------------------------------------------------
-
-    left = (
-        set(previous_players)
-        - set(current_players)
-    )
-
-    # --------------------------------------------------------
-    # Обрабатываем входы.
-    # --------------------------------------------------------
-
-    for key in joined:
-
-        player = current_players[
-            key
-        ]
-
-        add_player_log(
-            "join",
-            player,
+        joined_keys = (
+            set(current_players)
+            - set(previous_players)
         )
 
-        for chat_id in list(
-            log_subscribers
-        ):
+        # ====================================================
+        # ВЫШЕДШИЕ ИГРОКИ
+        # ====================================================
 
-            try:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🟢 <b>{safe(player)}</b> "
-                        "зашёл на сервер!"
-                    ),
-                    parse_mode="HTML",
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "Ошибка отправки JOIN: %s",
-                    e,
-                )
-
-    # --------------------------------------------------------
-    # Обрабатываем выходы.
-    # --------------------------------------------------------
-
-    for key in left:
-
-        player = previous_players[
-            key
-        ]
-
-        add_player_log(
-            "leave",
-            player,
+        left_keys = (
+            set(previous_players)
+            - set(current_players)
         )
 
-        for chat_id in list(
-            log_subscribers
-        ):
+        # ====================================================
+        # JOIN
+        # ====================================================
 
-            try:
+        for key in joined_keys:
 
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🔴 <b>{safe(player)}</b> "
-                        "вышел с сервера!"
-                    ),
-                    parse_mode="HTML",
-                )
+            player = (
+                current_players[key]
+            )
 
-            except Exception as e:
+            add_player_log(
+                "join",
+                player,
+            )
 
-                logger.warning(
-                    "Ошибка отправки LEAVE: %s",
-                    e,
-                )
+            for chat_id in list(
+                log_subscribers
+            ):
 
-    # --------------------------------------------------------
-    # Запоминаем новый список.
-    # --------------------------------------------------------
+                try:
 
-    previous_players = (
-        current_players
-    )
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🟢 <b>{player}</b> "
+                            "зашёл на сервер!"
+                        ),
+                        parse_mode="HTML",
+                    )
 
-    # --------------------------------------------------------
+                except Exception as e:
+
+                    logger.warning(
+                        "Ошибка уведомления: %s",
+                        e,
+                    )
+
+        # ====================================================
+        # LEAVE
+        # ====================================================
+
+        for key in left_keys:
+
+            player = (
+                previous_players[key]
+            )
+
+            add_player_log(
+                "leave",
+                player,
+            )
+
+            for chat_id in list(
+                log_subscribers
+            ):
+
+                try:
+
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🔴 <b>{player}</b> "
+                            "вышел с сервера!"
+                        ),
+                        parse_mode="HTML",
+                    )
+
+                except Exception as e:
+
+                    logger.warning(
+                        "Ошибка уведомления: %s",
+                        e,
+                    )
+
+        previous_players = (
+            current_players
+        )
+
+    # ========================================================
     # TARGET
-    # --------------------------------------------------------
+    # ========================================================
 
     for chat_id, target in list(
         targets.items()
@@ -1538,13 +1523,12 @@ async def automatic_check(
             "last_seen"
         ]
 
-        found = find_player(
-            data["players"],
-            target_name,
-        )
-
         current = (
-            found is not None
+            find_player(
+                players,
+                target_name,
+            )
+            is not None
         )
 
         if previous is None:
@@ -1569,7 +1553,7 @@ async def automatic_check(
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🟢 <b>{safe(target_name)}</b> "
+                        f"🟢 <b>{target_name}</b> "
                         "зашёл на сервер!"
                     ),
                     parse_mode="HTML",
@@ -1580,7 +1564,7 @@ async def automatic_check(
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🔴 <b>{safe(target_name)}</b> "
+                        f"🔴 <b>{target_name}</b> "
                         "вышел с сервера!"
                     ),
                     parse_mode="HTML",
@@ -1589,7 +1573,7 @@ async def automatic_check(
         except Exception as e:
 
             logger.warning(
-                "Ошибка TARGET: %s",
+                "Ошибка target уведомления: %s",
                 e,
             )
 
@@ -1600,17 +1584,6 @@ async def automatic_check(
 
 def main():
 
-    # Создаём JSON сразу,
-    # даже если Google Drive пока недоступен.
-    save_logs_local()
-
-    # Загружаем старые данные.
-    load_logs_from_drive()
-
-    # Ещё раз сохраняем после загрузки,
-    # чтобы локальный файл точно существовал.
-    save_logs_local()
-
     # Flask для Render.
     web_thread = threading.Thread(
         target=run_web,
@@ -1619,6 +1592,9 @@ def main():
 
     web_thread.start()
 
+    # Загружаем историю.
+    load_logs_from_drive()
+
     logger.info(
         "Запуск Telegram-бота..."
     )
@@ -1626,15 +1602,13 @@ def main():
     application = (
         Application
         .builder()
-        .token(
-            TELEGRAM_TOKEN
-        )
+        .token(TELEGRAM_TOKEN)
         .build()
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # COMMANDS
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1661,6 +1635,13 @@ def main():
         CommandHandler(
             "players",
             players_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ap",
+            ap_command,
         )
     )
 
@@ -1699,16 +1680,9 @@ def main():
         )
     )
 
-    application.add_handler(
-        CommandHandler(
-            "ap",
-            ap_command,
-        )
-    )
-
-    # --------------------------------------------------------
-    # ПРОВЕРКА КАЖДЫЕ 10 СЕКУНД
-    # --------------------------------------------------------
+    # ========================================================
+    # AUTOMATIC CHECK
+    # ========================================================
 
     application.job_queue.run_repeating(
         automatic_check,
